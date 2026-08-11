@@ -10,6 +10,11 @@ Pipeline:
      percentile, 75th, 95th, etc.) across that material's monthly totals.
   4. Build a material x month matrix of the netted quantities.
 
+Also checks that each material's rows share a single unit of entry, since
+mixed units (e.g. EA and KG) would make summed/netted quantities meaningless.
+Materials with mixed units are flagged in a "Unit Consistency" sheet and
+warned about on stdout.
+
 Results are written to a single .xlsx workbook with one sheet per step.
 
 Expected input columns (defaults match a standard SAP MB51 export):
@@ -29,6 +34,7 @@ DEFAULT_MATERIAL_COL = "Material"
 DEFAULT_DATE_COL = "Posting Date"
 DEFAULT_MOVEMENT_COL = "Movement Type"
 DEFAULT_QTY_COL = "Quantity"
+DEFAULT_UNIT_COL = "Unit of Entry"
 DEFAULT_NEGATIVE_MOVEMENT_TYPES = ("102",)
 
 
@@ -96,6 +102,24 @@ def net_daily_quantities(
     return net
 
 
+def check_unit_consistency(df: pd.DataFrame, material_col: str, unit_col: str) -> pd.DataFrame:
+    """Flag materials whose rows don't all share the same unit of entry.
+
+    Summing/netting a material's Quantity only makes sense if every row for
+    that material was recorded in the same unit; mixed units (e.g. EA and
+    KG) would make the netted totals meaningless.
+    """
+    working = df[[material_col, unit_col]].dropna(subset=[unit_col])
+    working[unit_col] = working[unit_col].astype(str).str.strip()
+
+    grouped = working.groupby(material_col)[unit_col].agg(lambda s: sorted(set(s)))
+    result = grouped.reset_index()
+    result.columns = [material_col, "units_found"]
+    result["unit_consistent"] = result["units_found"].apply(lambda units: len(units) <= 1)
+    result["units_found"] = result["units_found"].apply(", ".join)
+    return result.sort_values(material_col).reset_index(drop=True)
+
+
 def consolidate_by_month(net_daily: pd.DataFrame, material_col: str) -> pd.DataFrame:
     working = net_daily.copy()
     working["month"] = working["date"].dt.to_period("M").astype(str)
@@ -144,6 +168,21 @@ def run(args: argparse.Namespace, input_path: Path) -> None:
 
     df = load_receipts(input_path, sheet=args.sheet)
 
+    unit_check = None
+    if args.unit_column in df.columns:
+        unit_check = check_unit_consistency(df, args.material_column, args.unit_column)
+        inconsistent = unit_check[~unit_check["unit_consistent"]]
+        if not inconsistent.empty:
+            print(
+                f"Warning: {len(inconsistent)} material(s) have inconsistent "
+                f"{args.unit_column!r} values across rows:"
+            )
+            print(inconsistent.to_string(index=False))
+        else:
+            print(f"Unit check: all materials use a consistent {args.unit_column!r}.")
+    else:
+        print(f"Note: unit column {args.unit_column!r} not found in input; skipping unit consistency check.")
+
     net_daily = net_daily_quantities(
         df,
         material_col=args.material_column,
@@ -163,11 +202,21 @@ def run(args: argparse.Namespace, input_path: Path) -> None:
 
     matrix = build_material_month_matrix(monthly, material_col=args.material_column)
 
+    if unit_check is not None:
+        stats = stats.merge(
+            unit_check.set_index(args.material_column)[["units_found", "unit_consistent"]],
+            left_index=True,
+            right_index=True,
+            how="left",
+        )
+
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         matrix.to_excel(writer, sheet_name="Material x Month Matrix")
         stats.to_excel(writer, sheet_name="Material Statistics")
         monthly.to_excel(writer, sheet_name="Consolidated by Month", index=False)
         net_daily.to_excel(writer, sheet_name="Net Daily by Material", index=False)
+        if unit_check is not None:
+            unit_check.to_excel(writer, sheet_name="Unit Consistency", index=False)
 
     print(f"Materials: {matrix.shape[0]}, Months: {matrix.shape[1]}")
     print(f"Wrote {output_path}")
@@ -190,6 +239,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--date-column", default=DEFAULT_DATE_COL)
     parser.add_argument("--movement-column", default=DEFAULT_MOVEMENT_COL)
     parser.add_argument("--qty-column", default=DEFAULT_QTY_COL)
+    parser.add_argument(
+        "--unit-column",
+        default=DEFAULT_UNIT_COL,
+        help="Column to check for a consistent unit per material (e.g. 'Unit of Entry' or "
+        "'Base Unit of Measure'). Skipped if the column isn't present in the input.",
+    )
     parser.add_argument(
         "--negative-movement-types",
         default=",".join(DEFAULT_NEGATIVE_MOVEMENT_TYPES),
