@@ -29,6 +29,18 @@ DEFAULT_QTY_COL = "Quantity"
 DEFAULT_NEGATIVE_MOVEMENT_TYPES = ("102",)
 
 
+def prompt_for_input_path() -> Path:
+    """Ask the user where the raw receipts data lives (.csv or .xlsx)."""
+    while True:
+        raw = input("Path to receipts file (.csv or .xlsx): ").strip().strip('"')
+        if not raw:
+            continue
+        path = Path(raw)
+        if path.is_file():
+            return path
+        print(f"'{path}' does not exist or is not a file. Try again.")
+
+
 def _normalize_movement_type(value) -> str:
     if pd.isna(value):
         return ""
@@ -118,19 +130,7 @@ def build_material_month_matrix(monthly: pd.DataFrame, material_col: str) -> pd.
     return matrix.reindex(sorted(matrix.columns), axis=1)
 
 
-def prompt_for_input_path() -> Path:
-    while True:
-        raw = input("Path to receipts file (.csv or .xlsx): ").strip().strip('"')
-        if not raw:
-            continue
-        path = Path(raw)
-        if path.is_file():
-            return path
-        print(f"'{path}' does not exist or is not a file. Try again.")
-
-
-def run(args: argparse.Namespace) -> None:
-    input_path = Path(args.input) if args.input else prompt_for_input_path()
+def run(args: argparse.Namespace, input_path: Path) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -202,4 +202,8 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    run(parse_args())
+    # Get the raw data location first, before anything else runs.
+    cli_args = parse_args()
+    receipts_path = Path(cli_args.input) if cli_args.input else prompt_for_input_path()
+
+    run(cli_args, receipts_path)
