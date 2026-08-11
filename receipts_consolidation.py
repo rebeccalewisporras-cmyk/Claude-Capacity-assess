@@ -12,8 +12,11 @@ Pipeline:
 
 Also checks that each material's rows share a single unit of entry, since
 mixed units (e.g. EA and KG) would make summed/netted quantities meaningless.
-Materials with mixed units are flagged in a "Unit Consistency" sheet and
-warned about on stdout.
+Materials mixing units from a known dimension (e.g. G and KG, or CM and IN)
+are automatically converted to that dimension's base unit (KG, M, or L) via
+UNIT_CONVERSIONS. Materials mixing units with no known conversion between
+them are excluded from the analysis entirely. Both outcomes are reported in
+a "Unit Consistency" sheet and warned about on stdout.
 
 Results are written to a single .xlsx workbook with one sheet per step.
 
@@ -36,6 +39,37 @@ DEFAULT_MOVEMENT_COL = "Movement Type"
 DEFAULT_QTY_COL = "Quantity"
 DEFAULT_UNIT_COL = "Unit of Entry"
 DEFAULT_NEGATIVE_MOVEMENT_TYPES = ("102",)
+
+# Standard unit conversions, grouped by dimension. Each unit maps to the
+# factor that converts one of that unit into the dimension's base unit.
+# Only units listed here can be reconciled automatically; anything else
+# found mixed with another unit is excluded rather than guessed at.
+UNIT_CONVERSIONS = {
+    # Mass -> base KG
+    "G": ("mass", 0.001),
+    "GM": ("mass", 0.001),
+    "MG": ("mass", 0.000001),
+    "KG": ("mass", 1.0),
+    "TO": ("mass", 1000.0),
+    "T": ("mass", 1000.0),
+    "LB": ("mass", 0.45359237),
+    "OZ": ("mass", 0.028349523125),
+    # Length -> base M
+    "MM": ("length", 0.001),
+    "CM": ("length", 0.01),
+    "DM": ("length", 0.1),
+    "M": ("length", 1.0),
+    "KM": ("length", 1000.0),
+    "IN": ("length", 0.0254),
+    "FT": ("length", 0.3048),
+    "YD": ("length", 0.9144),
+    # Volume -> base L
+    "ML": ("volume", 0.001),
+    "CL": ("volume", 0.01),
+    "L": ("volume", 1.0),
+    "GAL": ("volume", 3.785411784),
+}
+BASE_UNIT_BY_DIMENSION = {"mass": "KG", "length": "M", "volume": "L"}
 
 
 def prompt_for_input_path() -> Path:
@@ -102,22 +136,92 @@ def net_daily_quantities(
     return net
 
 
-def check_unit_consistency(df: pd.DataFrame, material_col: str, unit_col: str) -> pd.DataFrame:
-    """Flag materials whose rows don't all share the same unit of entry.
+def resolve_units(
+    df: pd.DataFrame, material_col: str, unit_col: str, qty_col: str
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Reconcile each material's unit of entry.
 
-    Summing/netting a material's Quantity only makes sense if every row for
-    that material was recorded in the same unit; mixed units (e.g. EA and
-    KG) would make the netted totals meaningless.
+    - Materials already using a single unit are left untouched.
+    - Materials mixing units from the same known dimension (e.g. G and KG)
+      are converted to that dimension's base unit via UNIT_CONVERSIONS, so
+      their quantities become summable.
+    - Materials mixing units with no known/common conversion (e.g. EA and
+      KG) are excluded from the returned data entirely, since summing them
+      would be meaningless.
+
+    Returns (resolved_df, unit_report). resolved_df has qty_col converted
+    in place for reconciled materials and excluded materials' rows dropped.
     """
-    working = df[[material_col, unit_col]].dropna(subset=[unit_col])
+    working = df.copy()
     working[unit_col] = working[unit_col].astype(str).str.strip()
+    normalized = working[unit_col].str.upper()
 
-    grouped = working.groupby(material_col)[unit_col].agg(lambda s: sorted(set(s)))
-    result = grouped.reset_index()
-    result.columns = [material_col, "units_found"]
-    result["unit_consistent"] = result["units_found"].apply(lambda units: len(units) <= 1)
-    result["units_found"] = result["units_found"].apply(", ".join)
-    return result.sort_values(material_col).reset_index(drop=True)
+    records = []
+    excluded_materials = set()
+    converted_qty = working[qty_col].astype(float).copy()
+
+    for material, idx in working.groupby(material_col).groups.items():
+        material_units = normalized.loc[idx]
+        distinct_display = sorted({u for u in working.loc[idx, unit_col] if u and u.lower() != "nan"})
+        distinct_norm = sorted({u for u in material_units if u and u.lower() != "nan"})
+
+        if len(distinct_norm) <= 1:
+            records.append(
+                {
+                    material_col: material,
+                    "units_found": ", ".join(distinct_display),
+                    "unit_consistent": True,
+                    "converted": False,
+                    "target_unit": distinct_display[0] if distinct_display else "",
+                    "conversion_applied": "",
+                    "excluded": False,
+                }
+            )
+            continue
+
+        infos = {u: UNIT_CONVERSIONS.get(u) for u in distinct_norm}
+        known = {u: info for u, info in infos.items() if info is not None}
+        dimensions = {info[0] for info in known.values()}
+
+        if len(known) == len(distinct_norm) and len(dimensions) == 1:
+            dimension = next(iter(dimensions))
+            target_unit = BASE_UNIT_BY_DIMENSION[dimension]
+            factors = {u: known[u][1] for u in distinct_norm}
+            for row_i in idx:
+                converted_qty.loc[row_i] *= factors[material_units.loc[row_i]]
+            working.loc[idx, unit_col] = target_unit
+            conversion_applied = "; ".join(
+                f"1 {u} = {factors[u]:g} {target_unit}" for u in distinct_norm if u != target_unit
+            )
+            records.append(
+                {
+                    material_col: material,
+                    "units_found": ", ".join(distinct_display),
+                    "unit_consistent": True,
+                    "converted": True,
+                    "target_unit": target_unit,
+                    "conversion_applied": conversion_applied,
+                    "excluded": False,
+                }
+            )
+        else:
+            excluded_materials.add(material)
+            records.append(
+                {
+                    material_col: material,
+                    "units_found": ", ".join(distinct_display),
+                    "unit_consistent": False,
+                    "converted": False,
+                    "target_unit": "",
+                    "conversion_applied": "",
+                    "excluded": True,
+                }
+            )
+
+    working[qty_col] = converted_qty
+    resolved = working[~working[material_col].isin(excluded_materials)].copy()
+    report = pd.DataFrame.from_records(records).sort_values(material_col).reset_index(drop=True)
+    return resolved, report
 
 
 def consolidate_by_month(net_daily: pd.DataFrame, material_col: str) -> pd.DataFrame:
@@ -170,15 +274,20 @@ def run(args: argparse.Namespace, input_path: Path) -> None:
 
     unit_check = None
     if args.unit_column in df.columns:
-        unit_check = check_unit_consistency(df, args.material_column, args.unit_column)
-        inconsistent = unit_check[~unit_check["unit_consistent"]]
-        if not inconsistent.empty:
+        df, unit_check = resolve_units(df, args.material_column, args.unit_column, args.qty_column)
+
+        converted = unit_check[unit_check["converted"]]
+        excluded = unit_check[unit_check["excluded"]]
+        if not converted.empty:
+            print(f"Converted {len(converted)} material(s) to a common unit via standard conversions:")
+            print(converted[[args.material_column, "units_found", "target_unit", "conversion_applied"]].to_string(index=False))
+        if not excluded.empty:
             print(
-                f"Warning: {len(inconsistent)} material(s) have inconsistent "
-                f"{args.unit_column!r} values across rows:"
+                f"Warning: excluded {len(excluded)} material(s) with no standard conversion between "
+                f"their units (dropped from the analysis):"
             )
-            print(inconsistent.to_string(index=False))
-        else:
+            print(excluded[[args.material_column, "units_found"]].to_string(index=False))
+        if converted.empty and excluded.empty:
             print(f"Unit check: all materials use a consistent {args.unit_column!r}.")
     else:
         print(f"Note: unit column {args.unit_column!r} not found in input; skipping unit consistency check.")
@@ -204,7 +313,9 @@ def run(args: argparse.Namespace, input_path: Path) -> None:
 
     if unit_check is not None:
         stats = stats.merge(
-            unit_check.set_index(args.material_column)[["units_found", "unit_consistent"]],
+            unit_check.set_index(args.material_column)[
+                ["units_found", "unit_consistent", "converted", "target_unit", "conversion_applied"]
+            ],
             left_index=True,
             right_index=True,
             how="left",
