@@ -118,8 +118,19 @@ def build_material_month_matrix(monthly: pd.DataFrame, material_col: str) -> pd.
     return matrix.reindex(sorted(matrix.columns), axis=1)
 
 
+def prompt_for_input_path() -> Path:
+    while True:
+        raw = input("Path to receipts file (.csv or .xlsx): ").strip().strip('"')
+        if not raw:
+            continue
+        path = Path(raw)
+        if path.is_file():
+            return path
+        print(f"'{path}' does not exist or is not a file. Try again.")
+
+
 def run(args: argparse.Namespace) -> None:
-    input_path = Path(args.input)
+    input_path = Path(args.input) if args.input else prompt_for_input_path()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -154,7 +165,9 @@ def run(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--input", required=True, help="Path to the receipts export (.csv or .xlsx)")
+    parser.add_argument(
+        "--input", help="Path to the receipts export (.csv or .xlsx). Prompted for interactively if omitted."
+    )
     parser.add_argument("--sheet", default=0, help="Excel sheet name or index (ignored for CSV)")
     parser.add_argument("--output-dir", default="output", help="Directory to write result CSVs to")
     parser.add_argument("--material-column", default=DEFAULT_MATERIAL_COL)
