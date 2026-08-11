@@ -2,15 +2,18 @@
 """Consolidate SAP goods-receipt data (MB51-style export) by material and month.
 
 Pipeline:
-  1. Net quantities per material/date, treating movement type 102 as a
-     reversal of movement type 101 (i.e. 102 quantities are subtracted).
+  1. Net quantities per material/date. Movement type 102 is a reversal of
+     101: the source Quantity column is signed (102 rows negative, 101
+     rows positive), so netting is a plain sum per material/date.
   2. Roll the netted daily quantities up to material/month totals.
   3. Compute descriptive statistics per month across all materials.
   4. Build a material x month matrix of the netted quantities.
 
 Expected input columns (defaults match a standard SAP MB51 export):
   Material, Posting Date, Movement Type, Quantity
-Column names are configurable via CLI flags for other export layouts.
+Column names are configurable via CLI flags for other export layouts. If a
+source instead stores unsigned quantity magnitudes, pass --no-qty-is-signed
+so the sign is derived from --negative-movement-types instead.
 """
 
 import argparse
@@ -165,8 +168,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--qty-is-signed",
-        action="store_true",
-        help="Set if the quantity column is already signed (skip applying the movement-type sign)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Quantity column is already signed (e.g. 102 reversals stored as negative values). "
+        "Use --no-qty-is-signed if the source stores unsigned magnitudes instead, in which case "
+        "--negative-movement-types is applied to derive the sign.",
     )
     parser.add_argument(
         "--month-first-dates",
