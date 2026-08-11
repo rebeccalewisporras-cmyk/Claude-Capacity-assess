@@ -6,8 +6,11 @@ Pipeline:
      101: the source Quantity column is signed (102 rows negative, 101
      rows positive), so netting is a plain sum per material/date.
   2. Roll the netted daily quantities up to material/month totals.
-  3. Compute descriptive statistics per month across all materials.
+  3. Compute descriptive statistics per material (mean, median, bottom
+     percentile, 75th, 95th, etc.) across that material's monthly totals.
   4. Build a material x month matrix of the netted quantities.
+
+Results are written to a single .xlsx workbook with one sheet per step.
 
 Expected input columns (defaults match a standard SAP MB51 export):
   Material, Posting Date, Movement Type, Quantity
@@ -103,11 +106,16 @@ def consolidate_by_month(net_daily: pd.DataFrame, material_col: str) -> pd.DataF
     return monthly
 
 
-def compute_monthly_statistics(monthly: pd.DataFrame, bottom_percentile: float) -> pd.DataFrame:
+def compute_material_statistics(
+    monthly: pd.DataFrame, material_col: str, bottom_percentile: float
+) -> pd.DataFrame:
+    """One row per material, one column per descriptive statistic, computed
+    across that material's monthly net quantities."""
+
     def summarize(group: pd.Series) -> pd.Series:
         return pd.Series(
             {
-                "material_count": group.count(),
+                "month_count": group.count(),
                 "sum": group.sum(),
                 "mean": group.mean(),
                 "median": group.median(),
@@ -119,7 +127,7 @@ def compute_monthly_statistics(monthly: pd.DataFrame, bottom_percentile: float) 
             }
         )
 
-    stats = monthly.groupby("month")["net_qty"].apply(summarize).unstack()
+    stats = monthly.groupby(material_col)["net_qty"].apply(summarize).unstack()
     return stats.sort_index()
 
 
@@ -131,8 +139,8 @@ def build_material_month_matrix(monthly: pd.DataFrame, material_col: str) -> pd.
 
 
 def run(args: argparse.Namespace, input_path: Path) -> None:
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     df = load_receipts(input_path, sheet=args.sheet)
 
@@ -146,20 +154,24 @@ def run(args: argparse.Namespace, input_path: Path) -> None:
         dayfirst=not args.month_first_dates,
         qty_is_signed=args.qty_is_signed,
     )
-    net_daily.to_csv(output_dir / "net_daily_by_material.csv", index=False)
 
     monthly = consolidate_by_month(net_daily, material_col=args.material_column)
-    monthly.to_csv(output_dir / "consolidated_by_month.csv", index=False)
 
-    stats = compute_monthly_statistics(monthly, bottom_percentile=args.bottom_percentile)
-    stats.to_csv(output_dir / "monthly_statistics.csv")
+    stats = compute_material_statistics(
+        monthly, material_col=args.material_column, bottom_percentile=args.bottom_percentile
+    )
 
     matrix = build_material_month_matrix(monthly, material_col=args.material_column)
-    matrix.to_csv(output_dir / "material_month_matrix.csv")
+
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        matrix.to_excel(writer, sheet_name="Material x Month Matrix")
+        stats.to_excel(writer, sheet_name="Material Statistics")
+        monthly.to_excel(writer, sheet_name="Consolidated by Month", index=False)
+        net_daily.to_excel(writer, sheet_name="Net Daily by Material", index=False)
 
     print(f"Materials: {matrix.shape[0]}, Months: {matrix.shape[1]}")
-    print(f"Wrote outputs to {output_dir}/")
-    print("\nMonthly statistics:")
+    print(f"Wrote {output_path}")
+    print("\nMaterial statistics (across months):")
     print(stats.round(2).to_string())
 
 
@@ -169,7 +181,11 @@ def parse_args() -> argparse.Namespace:
         "--input", help="Path to the receipts export (.csv or .xlsx). Prompted for interactively if omitted."
     )
     parser.add_argument("--sheet", default=0, help="Excel sheet name or index (ignored for CSV)")
-    parser.add_argument("--output-dir", default="output", help="Directory to write result CSVs to")
+    parser.add_argument(
+        "--output",
+        default="output/receipts_consolidation.xlsx",
+        help="Path to the output .xlsx workbook to write",
+    )
     parser.add_argument("--material-column", default=DEFAULT_MATERIAL_COL)
     parser.add_argument("--date-column", default=DEFAULT_DATE_COL)
     parser.add_argument("--movement-column", default=DEFAULT_MOVEMENT_COL)
