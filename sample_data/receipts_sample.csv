@@ -1,4 +1,4 @@
-Material,Material Description,Posting Date,Movement Type,Quantity,Unit of Entry,Base Unit of Measure
+Material,Material Description,Posting Date,Movement Type,Qty in unit of entry,Unit of Entry,Base Unit of Measure
 MAT-0001,Widget 0001,01.01.2026,101,130.0,EA,EA
 MAT-0001,Widget 0001,05.01.2026,101,341.58,EA,EA
 MAT-0001,Widget 0001,03.02.2026,101,25.57,EA,EA

@@ -3,7 +3,7 @@
 
 Pipeline:
   1. Net quantities per material/date. Movement type 102 is a reversal of
-     101: the source Quantity column is signed (102 rows negative, 101
+     101: the source quantity column is signed (102 rows negative, 101
      rows positive), so netting is a plain sum per material/date.
   2. Roll the netted daily quantities up to material/month totals.
   3. Compute descriptive statistics per material (mean, median, bottom
@@ -21,7 +21,7 @@ a "Unit Consistency" sheet and warned about on stdout.
 Results are written to a single .xlsx workbook with one sheet per step.
 
 Expected input columns (defaults match a standard SAP MB51 export):
-  Material, Posting Date, Movement Type, Quantity
+  Material, Posting Date, Movement Type, Qty in unit of entry, Unit of Entry
 Column names are configurable via CLI flags for other export layouts. If a
 source instead stores unsigned quantity magnitudes, pass --no-qty-is-signed
 so the sign is derived from --negative-movement-types instead.
@@ -36,7 +36,7 @@ import pandas as pd
 DEFAULT_MATERIAL_COL = "Material"
 DEFAULT_DATE_COL = "Posting Date"
 DEFAULT_MOVEMENT_COL = "Movement Type"
-DEFAULT_QTY_COL = "Quantity"
+DEFAULT_QTY_COL = "Qty in unit of entry"
 DEFAULT_UNIT_COL = "Unit of Entry"
 DEFAULT_NEGATIVE_MOVEMENT_TYPES = ("102",)
 
@@ -310,6 +310,7 @@ def run(args: argparse.Namespace, input_path: Path) -> None:
     )
 
     matrix = build_material_month_matrix(monthly, material_col=args.material_column)
+    month_count = matrix.shape[1]
 
     if unit_check is not None:
         stats = stats.merge(
@@ -320,6 +321,8 @@ def run(args: argparse.Namespace, input_path: Path) -> None:
             right_index=True,
             how="left",
         )
+        unit_of_measure = unit_check.set_index(args.material_column)["target_unit"]
+        matrix.insert(0, "Unit of Measure", matrix.index.map(unit_of_measure))
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         matrix.to_excel(writer, sheet_name="Material x Month Matrix")
@@ -329,7 +332,7 @@ def run(args: argparse.Namespace, input_path: Path) -> None:
         if unit_check is not None:
             unit_check.to_excel(writer, sheet_name="Unit Consistency", index=False)
 
-    print(f"Materials: {matrix.shape[0]}, Months: {matrix.shape[1]}")
+    print(f"Materials: {matrix.shape[0]}, Months: {month_count}")
     print(f"Wrote {output_path}")
     print("\nMaterial statistics (across months):")
     print(stats.round(2).to_string())
