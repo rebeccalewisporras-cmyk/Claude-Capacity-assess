@@ -2,26 +2,31 @@
 """Consolidate SAP goods-receipt data (MB51-style export) by material and month.
 
 Pipeline:
-  1. Net quantities per material/date. Movement type 102 is a reversal of
-     101: the source quantity column is signed (102 rows negative, 101
-     rows positive), so netting is a plain sum per material/date.
-  2. Roll the netted daily quantities up to material/month totals.
-  3. Compute descriptive statistics per material (mean, median, bottom
-     percentile, 75th, 95th, etc.) across that material's monthly totals.
-  4. Build a material x month matrix of the netted quantities.
+  1. Net quantities per material/plant/date. Movement type 102 is a
+     reversal of 101: the source quantity column is signed (102 rows
+     negative, 101 rows positive), so netting is a plain sum per
+     material/plant/date. Plant is included because the same material can
+     be stocked at multiple plants, and a reversal only cancels a receipt
+     at the same plant.
+  2. Roll the netted daily quantities up to material/plant/month totals.
+  3. Compute descriptive statistics per material/plant (mean, median,
+     bottom percentile, 75th, 95th, etc.) across that combination's
+     monthly totals.
+  4. Build a material+plant x month matrix of the netted quantities.
 
-Also checks that each material's rows share a single unit of entry, since
-mixed units (e.g. EA and KG) would make summed/netted quantities meaningless.
-Materials mixing units from a known dimension (e.g. G and KG, or CM and IN)
-are automatically converted to that dimension's base unit (KG, M, or L) via
-UNIT_CONVERSIONS. Materials mixing units with no known conversion between
-them are excluded from the analysis entirely. Both outcomes are reported in
-a "Unit Consistency" sheet and warned about on stdout.
+Also checks that each material/plant's rows share a single unit of entry,
+since mixed units (e.g. EA and KG) would make summed/netted quantities
+meaningless. Combinations mixing units from a known dimension (e.g. G and
+KG, or CM and IN) are automatically converted to that dimension's base unit
+(KG, M, or L) via UNIT_CONVERSIONS. Combinations mixing units with no known
+conversion between them are excluded from the analysis entirely. Both
+outcomes are reported in a "Unit Consistency" sheet and warned about on
+stdout.
 
 Results are written to a single .xlsx workbook with one sheet per step.
 
 Expected input columns (defaults match a standard SAP MB51 export):
-  Material, Posting Date, Movement Type, Qty in unit of entry, Unit of Entry
+  Material, Plant, Posting Date, Movement Type, Qty in unit of entry, Unit of Entry
 Column names are configurable via CLI flags for other export layouts. If a
 source instead stores unsigned quantity magnitudes, pass --no-qty-is-signed
 so the sign is derived from --negative-movement-types instead.
@@ -34,6 +39,7 @@ import numpy as np
 import pandas as pd
 
 DEFAULT_MATERIAL_COL = "Material"
+DEFAULT_PLANT_COL = "Plant"
 DEFAULT_DATE_COL = "Posting Date"
 DEFAULT_MOVEMENT_COL = "Movement Type"
 DEFAULT_QTY_COL = "Qty in unit of entry"
@@ -102,6 +108,7 @@ def load_receipts(path: Path, sheet: str | int = 0) -> pd.DataFrame:
 def net_daily_quantities(
     df: pd.DataFrame,
     material_col: str,
+    plant_col: str,
     date_col: str,
     movement_col: str,
     qty_col: str,
@@ -109,7 +116,7 @@ def net_daily_quantities(
     dayfirst: bool,
     qty_is_signed: bool,
 ) -> pd.DataFrame:
-    working = df[[material_col, date_col, movement_col, qty_col]].copy()
+    working = df[[material_col, plant_col, date_col, movement_col, qty_col]].copy()
 
     working[date_col] = pd.to_datetime(working[date_col], dayfirst=dayfirst, errors="coerce")
     dropped_dates = working[date_col].isna().sum()
@@ -129,7 +136,7 @@ def net_daily_quantities(
     working["date"] = working[date_col].dt.normalize()
 
     net = (
-        working.groupby([material_col, "date"], as_index=False)["signed_qty"]
+        working.groupby([material_col, plant_col, "date"], as_index=False)["signed_qty"]
         .sum()
         .rename(columns={"signed_qty": "net_qty"})
     )
@@ -137,38 +144,42 @@ def net_daily_quantities(
 
 
 def resolve_units(
-    df: pd.DataFrame, material_col: str, unit_col: str, qty_col: str
+    df: pd.DataFrame, material_col: str, plant_col: str, unit_col: str, qty_col: str
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Reconcile each material's unit of entry.
+    """Reconcile each material/plant combination's unit of entry.
 
-    - Materials already using a single unit are left untouched.
-    - Materials mixing units from the same known dimension (e.g. G and KG)
-      are converted to that dimension's base unit via UNIT_CONVERSIONS, so
-      their quantities become summable.
-    - Materials mixing units with no known/common conversion (e.g. EA and
-      KG) are excluded from the returned data entirely, since summing them
-      would be meaningless.
+    - Combinations already using a single unit are left untouched.
+    - Combinations mixing units from the same known dimension (e.g. G and
+      KG) are converted to that dimension's base unit via
+      UNIT_CONVERSIONS, so their quantities become summable.
+    - Combinations mixing units with no known/common conversion (e.g. EA
+      and KG) are excluded from the returned data entirely, since summing
+      them would be meaningless.
 
     Returns (resolved_df, unit_report). resolved_df has qty_col converted
-    in place for reconciled materials and excluded materials' rows dropped.
+    in place for reconciled combinations and excluded combinations' rows
+    dropped.
     """
+    group_cols = [material_col, plant_col]
     working = df.copy()
     working[unit_col] = working[unit_col].astype(str).str.strip()
     normalized = working[unit_col].str.upper()
 
     records = []
-    excluded_materials = set()
+    excluded_keys = set()
     converted_qty = working[qty_col].astype(float).copy()
 
-    for material, idx in working.groupby(material_col).groups.items():
-        material_units = normalized.loc[idx]
+    for key, idx in working.groupby(group_cols).groups.items():
+        material, plant = key
+        key_units = normalized.loc[idx]
         distinct_display = sorted({u for u in working.loc[idx, unit_col] if u and u.lower() != "nan"})
-        distinct_norm = sorted({u for u in material_units if u and u.lower() != "nan"})
+        distinct_norm = sorted({u for u in key_units if u and u.lower() != "nan"})
 
         if len(distinct_norm) <= 1:
             records.append(
                 {
                     material_col: material,
+                    plant_col: plant,
                     "units_found": ", ".join(distinct_display),
                     "unit_consistent": True,
                     "converted": False,
@@ -188,7 +199,7 @@ def resolve_units(
             target_unit = BASE_UNIT_BY_DIMENSION[dimension]
             factors = {u: known[u][1] for u in distinct_norm}
             for row_i in idx:
-                converted_qty.loc[row_i] *= factors[material_units.loc[row_i]]
+                converted_qty.loc[row_i] *= factors[key_units.loc[row_i]]
             working.loc[idx, unit_col] = target_unit
             conversion_applied = "; ".join(
                 f"1 {u} = {factors[u]:g} {target_unit}" for u in distinct_norm if u != target_unit
@@ -196,6 +207,7 @@ def resolve_units(
             records.append(
                 {
                     material_col: material,
+                    plant_col: plant,
                     "units_found": ", ".join(distinct_display),
                     "unit_consistent": True,
                     "converted": True,
@@ -205,10 +217,11 @@ def resolve_units(
                 }
             )
         else:
-            excluded_materials.add(material)
+            excluded_keys.add(key)
             records.append(
                 {
                     material_col: material,
+                    plant_col: plant,
                     "units_found": ", ".join(distinct_display),
                     "unit_consistent": False,
                     "converted": False,
@@ -219,26 +232,27 @@ def resolve_units(
             )
 
     working[qty_col] = converted_qty
-    resolved = working[~working[material_col].isin(excluded_materials)].copy()
-    report = pd.DataFrame.from_records(records).sort_values(material_col).reset_index(drop=True)
+    excluded_mask = working.set_index(group_cols).index.isin(excluded_keys)
+    resolved = working[~excluded_mask].copy()
+    report = pd.DataFrame.from_records(records).sort_values(group_cols).reset_index(drop=True)
     return resolved, report
 
 
-def consolidate_by_month(net_daily: pd.DataFrame, material_col: str) -> pd.DataFrame:
+def consolidate_by_month(net_daily: pd.DataFrame, material_col: str, plant_col: str) -> pd.DataFrame:
     working = net_daily.copy()
     working["month"] = working["date"].dt.to_period("M").astype(str)
     monthly = (
-        working.groupby([material_col, "month"], as_index=False)["net_qty"]
+        working.groupby([material_col, plant_col, "month"], as_index=False)["net_qty"]
         .sum()
     )
     return monthly
 
 
 def compute_material_statistics(
-    monthly: pd.DataFrame, material_col: str, bottom_percentile: float
+    monthly: pd.DataFrame, material_col: str, plant_col: str, bottom_percentile: float
 ) -> pd.DataFrame:
-    """One row per material, one column per descriptive statistic, computed
-    across that material's monthly net quantities."""
+    """One row per material/plant, one column per descriptive statistic,
+    computed across that combination's monthly net quantities."""
 
     def summarize(group: pd.Series) -> pd.Series:
         return pd.Series(
@@ -255,13 +269,13 @@ def compute_material_statistics(
             }
         )
 
-    stats = monthly.groupby(material_col)["net_qty"].apply(summarize).unstack()
+    stats = monthly.groupby([material_col, plant_col])["net_qty"].apply(summarize).unstack()
     return stats.sort_index()
 
 
-def build_material_month_matrix(monthly: pd.DataFrame, material_col: str) -> pd.DataFrame:
+def build_material_month_matrix(monthly: pd.DataFrame, material_col: str, plant_col: str) -> pd.DataFrame:
     matrix = monthly.pivot_table(
-        index=material_col, columns="month", values="net_qty", aggfunc="sum", fill_value=0.0
+        index=[material_col, plant_col], columns="month", values="net_qty", aggfunc="sum", fill_value=0.0
     )
     return matrix.reindex(sorted(matrix.columns), axis=1)
 
@@ -272,29 +286,32 @@ def run(args: argparse.Namespace, input_path: Path) -> None:
 
     df = load_receipts(input_path, sheet=args.sheet)
 
+    group_cols = [args.material_column, args.plant_column]
+
     unit_check = None
     if args.unit_column in df.columns:
-        df, unit_check = resolve_units(df, args.material_column, args.unit_column, args.qty_column)
+        df, unit_check = resolve_units(df, args.material_column, args.plant_column, args.unit_column, args.qty_column)
 
         converted = unit_check[unit_check["converted"]]
         excluded = unit_check[unit_check["excluded"]]
         if not converted.empty:
-            print(f"Converted {len(converted)} material(s) to a common unit via standard conversions:")
-            print(converted[[args.material_column, "units_found", "target_unit", "conversion_applied"]].to_string(index=False))
+            print(f"Converted {len(converted)} material/plant combination(s) to a common unit via standard conversions:")
+            print(converted[group_cols + ["units_found", "target_unit", "conversion_applied"]].to_string(index=False))
         if not excluded.empty:
             print(
-                f"Warning: excluded {len(excluded)} material(s) with no standard conversion between "
-                f"their units (dropped from the analysis):"
+                f"Warning: excluded {len(excluded)} material/plant combination(s) with no standard "
+                f"conversion between their units (dropped from the analysis):"
             )
-            print(excluded[[args.material_column, "units_found"]].to_string(index=False))
+            print(excluded[group_cols + ["units_found"]].to_string(index=False))
         if converted.empty and excluded.empty:
-            print(f"Unit check: all materials use a consistent {args.unit_column!r}.")
+            print(f"Unit check: all material/plant combinations use a consistent {args.unit_column!r}.")
     else:
         print(f"Note: unit column {args.unit_column!r} not found in input; skipping unit consistency check.")
 
     net_daily = net_daily_quantities(
         df,
         material_col=args.material_column,
+        plant_col=args.plant_column,
         date_col=args.date_column,
         movement_col=args.movement_column,
         qty_col=args.qty_column,
@@ -303,36 +320,38 @@ def run(args: argparse.Namespace, input_path: Path) -> None:
         qty_is_signed=args.qty_is_signed,
     )
 
-    monthly = consolidate_by_month(net_daily, material_col=args.material_column)
+    monthly = consolidate_by_month(net_daily, material_col=args.material_column, plant_col=args.plant_column)
 
     stats = compute_material_statistics(
-        monthly, material_col=args.material_column, bottom_percentile=args.bottom_percentile
+        monthly, material_col=args.material_column, plant_col=args.plant_column, bottom_percentile=args.bottom_percentile
     )
 
-    matrix = build_material_month_matrix(monthly, material_col=args.material_column)
+    matrix = build_material_month_matrix(monthly, material_col=args.material_column, plant_col=args.plant_column)
     month_count = matrix.shape[1]
 
     if unit_check is not None:
+        unit_check_indexed = unit_check.set_index(group_cols)
         stats = stats.merge(
-            unit_check.set_index(args.material_column)[
-                ["units_found", "unit_consistent", "converted", "target_unit", "conversion_applied"]
-            ],
+            unit_check_indexed[["units_found", "unit_consistent", "converted", "target_unit", "conversion_applied"]],
             left_index=True,
             right_index=True,
             how="left",
         )
-        unit_of_measure = unit_check.set_index(args.material_column)["target_unit"]
+        unit_of_measure = unit_check_indexed["target_unit"]
         matrix.insert(0, "Unit of Measure", matrix.index.map(unit_of_measure))
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        matrix.to_excel(writer, sheet_name="Material x Month Matrix")
-        stats.to_excel(writer, sheet_name="Material Statistics")
+        # reset_index (rather than the default merge_cells=True) so Material/Plant are
+        # repeated on every row instead of being blank on repeats -- blank cells read
+        # back as NaN and make the sheet unusable as flat data.
+        matrix.reset_index().to_excel(writer, sheet_name="Material x Month Matrix", index=False)
+        stats.reset_index().to_excel(writer, sheet_name="Material Statistics", index=False)
         monthly.to_excel(writer, sheet_name="Consolidated by Month", index=False)
         net_daily.to_excel(writer, sheet_name="Net Daily by Material", index=False)
         if unit_check is not None:
             unit_check.to_excel(writer, sheet_name="Unit Consistency", index=False)
 
-    print(f"Materials: {matrix.shape[0]}, Months: {month_count}")
+    print(f"Material/plant combinations: {matrix.shape[0]}, Months: {month_count}")
     print(f"Wrote {output_path}")
     print("\nMaterial statistics (across months):")
     print(stats.round(2).to_string())
@@ -350,6 +369,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to the output .xlsx workbook to write",
     )
     parser.add_argument("--material-column", default=DEFAULT_MATERIAL_COL)
+    parser.add_argument("--plant-column", default=DEFAULT_PLANT_COL)
     parser.add_argument("--date-column", default=DEFAULT_DATE_COL)
     parser.add_argument("--movement-column", default=DEFAULT_MOVEMENT_COL)
     parser.add_argument("--qty-column", default=DEFAULT_QTY_COL)
